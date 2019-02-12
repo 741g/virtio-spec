@@ -1,0 +1,561 @@
+\section{User Device}\label{sec:Device Types / User Device}
+
+Note: This depends on the upcoming shared-mem type of virtio.
+
+virtio-user is an interface for defining and operating virtual devices
+with high performance.
+It is intended that virtio-user serve a need for defining userspace drivers
+for virtual machines, but it can be used for kernel drivers as well,
+and there are several benefits to this approach that can potentially
+make it more flexible and performant than commonly suggested alternatives.
+
+virtio-user is configured at virtio-user device realization time.
+The host enumerates a set of available devices for virtio-user
+and the guest is able to use the available ones
+according to a privately-defined protocol
+that uses a combination of virtqueues and shared memory.
+
+virtio-user has three main virtqueue types: config, ping, and event.
+The config virtqueue is used to enumerate devices, create instances, and allocate shared memory.
+The ping virtqueue is optionally used as a doorbell to notify the host to process data.
+The event virtqueue is optinally used to wait for the host to complete operations
+from the guest.
+
+On the host, callbacks specific to the enumerated device are issued
+on enumeration, instance creation, shared memory operations, and ping.
+These device implementations are stored in shared library plugins
+separate from the host hypervisor.
+The host hypervisor implements a minimal set of operations to allow
+the dispatch to happen and to send back event virtqueue messages.
+
+The main benefit of virtio-user is
+to decouple definition of new drivers and devices
+from the underlying transport protocol
+and from the host hypervisor implementation.
+Virtio-user then serves as
+a platform for "userspace" drivers for virtual machines;
+"userspace" in the literal sense of allowing guest drivers
+to be userspace-defined, decoupled from the guest kernel,
+"userspace" in the sense of device implementations
+being defined away from the "kernel" of the host hypervisor code.
+
+The second benefit of virtio-user is high performance via shared memory
+(Note: This depends on the upcoming shared-mem type of virtio).
+Each driver/device created from userspace or the guest kernel
+is allowed to create or share regions of shared memory.
+Sharing can be done with other virtio-user devices only,
+though it may be possible to share with other virtio devices if that is beneficial.
+
+Another benefit derives from
+the separation between the driver definition from the transport protocol.
+The implementation of all such user-level drivers
+is captured by a set of primitive operations in the guest
+and shared library function pointers in the host.
+Because of this, virtio-user itself will have a very small implementation footprint,
+allowing it to be readily used with a wide variety of guest OSes and host VMMs,
+while sharing the same driver/device functionality
+defined in the guest and defined in a shared library on the host.
+This facilitates using any particular virtual device in many different guest OSes and host VMMs.
+
+Finally, this has the benefit of being
+a general standardization path for existing non-standard devices to use virtio;
+if a new device type is introduced that can be used with virtio,
+it can be implemented on top of virtio-user first and work immediately
+all existing guest OSes / host hypervisors supporting virtio-user.
+virtio-user can be used to as a staging area for potential new
+virtio device types, and moved to new virtio device types as appropriate.
+Currently, virtio-vsock is often suggested as a generic pipe,
+but from the standardization point of view,
+doing so causes de-facto non-portability;
+there is no standard way to enumerate how such generic pipes are used.
+
+Note that virtio-serial/virtio-vsock is not considered
+because they do not standardize the set of devices that operate on top of them,
+but in practice, are often used for fully general devices.
+Spec-wise, this is not a great situation because we would still have potentially
+non portable device implementations where there is no standard mechanism to
+determine whether or not things are portable.
+virtio-user provides a device enumeration mechanism to better control this.
+
+In addition, for performance considerations
+in applications such as graphics and media,
+virtio-serial/virtio-vsock have the overhead of sending actual traffic
+through the virtqueue, while an approach based on shared memory
+can result in having fewer copies and virtqueue messages.
+virtio-serial is also limited in being specialized for console forwarding
+and having a cap on the number of clients.
+virtio-vsock is also not optimal in its choice of sockets API for
+transport; shared memory cannot be used,
+arbitrary strings can be passed without an designation of the device/driver being run de-facto,
+and the guest must have additional machinery to handle socket APIs.
+In addition, on the host, sockets are only dependable on Linux,
+with less predictable behavior from Windows/macOS regarding Unix sockets.
+Waiting for socket traffic on the host also requires a poll() loop,
+which is suboptimal for latency.
+With virtio-user, only the bare set of standard driver calls (open/close/ioctl/mmap/read) is needed,
+and RAM is a more universal transport abstraction.
+We also explicitly spec out callbacks on host that are triggered by virtqueue messages,
+which results in lower latency and makes it easy to dispatch to a particular device implementation
+without polling.
+
+\subsection{Device ID}\label{sec:Device Types / User Device / Device ID}
+
+21
+
+\subsection{Virtqueues}\label{sec:Device Types / User Device / Virtqueues}
+
+\begin{description}
+\item[0] config tx
+\item[1] config rx
+\item[2] ping
+\item[3] event
+\end{description}
+
+\subsection{Feature bits}\label{sec: Device Types / User Device / Feature bits }
+
+No feature bits, unless we go with this alternative:
+
+An alternative is to specify the possible drivers/devices in the feature bits themselves.
+This ensures that there is a standard place where such devices are defined.
+However, changing the feature bits would require updates to the spec, driver, and hypervisor,
+which may not be as well suited to fast iteration,
+and has the undesirable property of coupling device changes to hypervisor changes.
+
+\subsubsection{Feature bit requirements}\label{sec:Device Types / User Device / Feature bit requirements}
+
+No feature bit requirements, unless we go with device enumeration in feature bits.
+
+\subsection{Device configuration layout}\label{sec:Device Types / User Device / Device configuration layout}
+
+\begin{lstlisting}
+struct virtio_user_config {
+    le32 enumeration_space_id;
+};
+\end{lstlisting}
+
+These serve to identify the virtio-user instance for purposes of compatibility.
+Userspace drivers/devices enumerated under the same \field{enumeration_space_id} that match are considered to be compatible.
+The guest may not write to \field{enumeration_space_id}.
+The host writes once to \field{enumeration_space_id} on initialization.
+
+\subsection{Device Initialization}\label{sec:Device Types / User Device / Device Initialization}
+
+The enumeration space id is read from the host into \field{virtio_user_config.enumeration_space_id}.
+
+On device startup, the config virtqueue is used to enumerate a set of virtual devices available on the host.
+They are then registered to the guest in a way that is specific to the guest OS,
+such as misc_register for Linux.
+
+Buffers are added to the config virtqueues
+to enumerate available userspace drivers,
+to create / destroy userspace device contexts,
+or to alloc / free / import / export shared memory.
+
+Buffers are added to the ping virtqueue to notify the host of device specific operations
+or to notify the host that there is available shared memory to consume.
+This is like a doorbell with user-defined semantics.
+
+Buffers are added to the event virtqueue from the device to the driver to
+notify the driver that an operation has completed.
+
+\subsection{Device Operation}\label{sec:Device Types / User Device / Device Operation}
+
+\subsubsection{Config Virtqueue Messages}\label{sec:Device Types / User Device / Device Operation / Config Virtqueue Messages}
+
+Operation always begins on the config virtqueue.
+Messages transmitted or received on the config virtqueue are of the following structure:
+
+\begin{lstlisting}
+struct virtio_user_config_msg {
+    le32 msg_type;
+    le32 device_count;
+    le32 vendor_ids[MAX_DEVICES];
+    le32 device_ids[MAX_DEVICES];
+    le32 versions[MAX_DEVICES];
+    le64 instance_handle;
+    le64 shm_id;
+    le64 shm_offset;
+    le64 shm_size;
+    le32 shm_flags;
+    le32 error;
+}
+\end{lstlisting}
+
+\field{MAX_DEVICES} is defined as 32.
+\field{msg_type} can only be one of the following:
+
+\begin{lstlisting}
+enum {
+    VIRTIO_USER_CONFIG_OP_ENUMERATE_DEVICES;
+    VIRTIO_USER_CONFIG_OP_CREATE_INSTANCE;
+    VIRTIO_USER_CONFIG_OP_DESTROY_INSTANCE;
+    VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_ALLOC;
+    VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_FREE;
+    VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_EXPORT;
+    VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_IMPORT;
+}
+\end{lstlisting}
+
+\field{error} can only be one of the following:
+
+\begin{lstlisting}
+enum {
+    VIRTIO_USER_ERROR_CONFIG_DEVICE_INITIALIZATION_FAILED;
+    VIRTIO_USER_ERROR_CONFIG_INSTANCE_CREATION_FAILED;
+    VIRTIO_USER_ERROR_CONFIG_SHARED_MEMORY_ALLOC_FAILED;
+    VIRTIO_USER_ERROR_CONFIG_SHARED_MEMORY_EXPORT_FAILED;
+    VIRTIO_USER_ERROR_CONFIG_SHARED_MEMORY_IMPORT_FAILED;
+}
+\end{lstlisting}
+
+When the guest starts, a \field{virtio_user_config_msg}
+with  \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_ENUMERATE_DEVICES} is sent
+from the guest to the host on the config tx virtqueue. All other fields are ignored.
+
+The guest then receives a \field{virtio_user_config_msg}
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_ENUMERATE_DEVICES},
+with \field{device_count} populated with the number of available devices,
+the \field{vendor_ids} array populated with \field{device_count} vendor ids,
+the \field{device_ids} array populated with \field{device_count} device ids,
+and the \field{versions} array populated with \field{device_count} device versions.
+
+The results can be obtained more than once, and the same results will always be received
+by the guest as long as there is no change to existing virtio userspace devices.
+
+The guest now knows which devices are available, in addition to \field{enumeration_space_id}.
+It is guaranteed that host/guest setups with the same \field{enumeration space id},
+\field{device_count}, \field{device_ids}, \field{vendor_ids},
+and \field{versions} arrays (up to \field{device_count})
+operate the same way as far as virtio-user devices.
+There are the following relaxations:
+
+\begin{enumerate}
+\item If a particular combination of IDs in \field{device_ids} / \field{vendor_ids} is missing,
+the guest can still continue with the existing set of devices.
+\item If a particular combination of IDs in \field{device_ids} / \field{vendor_ids} mismatch in \field{versions},
+the guest can still continue provided the version is deemed ``compatible'' by the guest,
+which is determined by the particular device implementation.
+Some devices are never compatible between versions
+while other devices are backward and/or forward compatible.
+\end{enumerate}
+
+Next, instances, which are particular userspace contexts surrounding devices, are created.
+
+Creating instances:
+The guest sends a \field{virtio_user_config_msg}
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_CREATE_INSTANCE}
+on the config tx virtqueue.
+The first IDs and versions number in \field{vendor_ids}/\field{device_ids}/\field{versions}
+On the host,
+a new \field{instance_handle} is generated,
+and a device-specific instance creation function is run
+based on the vendor, device, and version.
+
+If unsuccessful, \field{error} is set and sent back to the guest
+on the config rx virtqueue, and the \field{instance_handle} is discarded.
+If successfull,
+a \field{virtio_user_config_msg}
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_CREATE_INSTANCE}
+and \field{instance_handle} equal to the generated handle
+is sent on the config rx virtqueue.
+
+The instance creation function is a callback function that is tied
+to a plugin associated with the vendor and device id in question:
+
+(le64 instance_handle) -> bool
+
+returning true if instance creation succeeded,
+and false if failed.
+
+Let's call this \field{on_create_instance}.
+
+Destroying instance:
+The guest sends a \field{virtio_user_config_msg}
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_DESTROY_INSTANCE}
+on the config tx virtqueue.
+The only field that needs to be populated
+is \field{instance_handle}.
+On the host, a device-specific instance destruction function is run:
+
+(instance_handle) -> void
+
+Let's call this \field{on_destroy_instance}.
+
+Also, all \field{shm_id}'s have their memory freed by instance destruction
+only if the shared memory was not exported (detailed below).
+
+Next, shared memory is set up to back device operation.
+This depends on the particular guest in question and what drivers/devices are being used.
+The shared memory configuration operations are as follows:
+
+Allocating shared memory:
+The guest sends a \field{virtio_user_config_msg}
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_ALLOC}
+on the config tx virtqueue.
+\field{instance_handle} needs to be a valid instance handle generated by the host.
+\field{shm_size} must be set and greater than zero.
+A new shared memory region is created in the PCI address space (actual allocation is deferred).
+If any operation fails, a message on the config tx virtqueue
+with \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_ALLOC}
+and \field{error} equal to \field{VIRTIO_USER_ERROR_CONFIG_SHARED_MEMORY_ALLOC_FAILED}
+is sent.
+If all operations succeed,
+a new \field{shm_id} is generated along with \field{shm_offset} (offset into the PCI).
+and sent back on the config tx virtqueue.
+
+Freeing shared memory objects works in a similar way,
+with setting \field{msg_type} equal to \field{VIRTIO_USER_CONFIG_OP_SHARED_MEMORY_FREE}.
+If the memory has been shared,
+it is refcounted based on how many instance have used it.
+When the refcount reaches 0,
+the host hypervisor will explicitly unmap that shared memory object
+from any existing host pointers.
+
+To export a shared memory object, we need to have a valid \field{instance_handle}
+and an allocated shared memory object with a valid \field{shm_id}.
+The export operation itself for now is mostly administrative;
+it marks that allocated memory as available for sharing.
+
+To import a shared memory object, we need to have a valid \field{instance_handle}
+and an allocated shared memory object with a valid \field{shm_id}
+that has been allocated and exported. A new \field{shm_id} is not generated;
+this is mostly administrative and marks that that \field{shm_id}
+can also be used from the second instance.
+This is for sharing memory, so \field{instance_handle} need not
+be the same as the \field{instance_handle} that allocated the shared memory.
+
+This is similar to Vulkan \field{VK_KHR_external_memory},
+except over raw PCI address space and \field{shm_id}'s.
+
+For mapping and unmapping shared memory objects,
+we do not include explicit virtqueue methods for these,
+and instead rely on the guest kernel's memory mapping primitives.
+
+Flow control: Only one config message is allowed to be in flight
+either to or from the host at any time.
+That is, the handshake tx/rx for device enumeration, instance creation, and shared memory operations
+are done in a globally visible single threaded manner.
+This is to make it easier to synchronize operations on shared memory and instance creation.
+
+\subsubsection{Ping Virtqueue Messages}\label{sec:Device Types / User Device / Device Operation / Ping Virtqueue Messages}
+
+Once the instances have been created and configured with shared memory,
+we can already read/write memory, and for some device that may already be enough
+if they can operate lock-free and wait-free without needing notifications; we're done!
+
+However, in order to prevent burning up CPU in most cases,
+most devices need some kind of mechanism to trigger activity on the device
+from the guest. This is captured via a new message struct,
+which is separate from the config struct because it's smaller and
+the common case is to send those messages.
+These messages are sent from the guest to host
+on the ping virtqueue.
+
+\begin{lstlisting}
+struct virtio_user_ping {
+    le64 instance_handle;
+    le64 metadata;
+    le64 shm_id;
+    le64 shm_offset;
+    le64 shm_size;
+    le32 events;
+}
+\end{lstlisting}
+
+\field{instance_handle} must be a valid instance handle.
+\field{shm_id} need not be a valid shm_id.
+If \field{shm_id} is a valid shm_id,
+it need not be allocated on the host yet.
+
+On the device side, each ping results in calling a callback function of type:
+
+(instance_handle, metadata, phys_addr, host_ptr, events) -> revents
+
+Let us call this function \field{on_instance_ping}.
+It returns revents, which is optionally used in event virtqueue replies.
+
+If \field{shm_id} is a valid shm_id,
+\field{phys_addr} is resolved given \field{shm_offset} by either
+the virtio-user driver or the host hypervisor.
+
+If \field{shm_id} is a valid shm_id
+and there is a mapping set up for \field{phys_addr},
+\field{host_ptr} refers to the corresponding memory view in the host address space.
+This allows coherent access to device memory from both the host and guest, given
+a few extra considerations.
+For example, for architectures that do not have store/load coherency (i.e., not x86)
+an explicit set of fence or synchronization instructions will also be run by virtio-user
+both before and after the call to \field{on_instance_ping}.
+An alternative is to leave this up to the implementor of the virtual device,
+but it is going to be such a common case to synchronize views of the same memory
+that it is probably a good idea to include synchronization out of the box.
+
+Although, it may be common to block a guest thread until \field{on_instance_ping}
+completes on the device side.
+That is the purpose of the \field{events} field; the guest can populate it
+if it is desired to sync on the host completion.
+If \field{events} is not zero, then a reply is sent
+back to the guest via the event virtqueue  after \field{on_instance_ping} completes,
+with the \field{revents} return value.
+
+Flow control: Arbitrary levels of traffic can be sent
+on the ping virtqueue from multiple instances at the same time,
+but ordering within an instance is strictly preserved.
+Additional resources outside the virtqueue are used to hold incoming messages
+if the virtqueue itself fills up.
+This is similar to how virtio-vsock handles high traffic.
+
+The semantics of ping messages themselves also are not restricted to guest to host only;
+the shared memory region named in the message can also be filled by the host
+and used as receive traffic by the guest.
+The ping message is then suitable for DMA operations in both directions,
+such as glTexImage2D and glReadPixels,
+and audio/video (de)compression (guest populates shared memory with (de)compressed buffers,
+sends ping message, host (de)compresses into the same memory region).
+
+\subsubsection{Event Virtqueue Messages}\label{sec:Device Types / User Device / Device Operation / Event Virtqueue Messages}
+
+Ping virtqueue messages are enough to cover all async device operations;
+that is, operations that do not require a round trip from the host.
+This is useful for most kinds of graphics API forwarding along
+with media codecs.
+
+However, it can still be important to synchronize the guest on the completion
+of a device operation.
+
+In the userspace driver, the interface can be similar to Linux uio interrupts for example;
+a blocking read() of an device is done and after unblocking,
+the operation has completed.
+The exact way of waiting is dependent on the guest OS.
+
+However, it is all implemented on the event virtqueue. The message type:
+
+\begin{lstlisting}
+struct virtio_user_event {
+    le64 instance_handle;
+    le32 revents;
+}
+\end{lstlisting}
+
+Event messages are sent back to the guest if \field{events} field is nonzero,
+as detailed in the section on ping virtqueue messages.
+
+The guest driver can distinguish which instance receives which ping using
+\field{instance_handle}.
+The field \field{revents} is written by the return value of
+\field{on_instance_ping} from the device side.
+
+\subsection{Kernel Drivers via virtio-user}\label{sec:Device Types / User Device / Kernel Drivers via virtio-user}
+
+It is not a hard restriction for instances to be created from guest userspace;
+there are many kernel mechanisms such as sync fd's and USB devices
+that can benefit from running on top of virtio-user.
+
+Provided the functionality exists in the guest kernel, virtio-user
+shall expose all of its operations to other kernel drivers as well.
+
+\subsection{Kernel and Hypervisor Portability Requirements}\label{sec:Device Types / User Device / Kernel and Hypervisor Portability Requirements}
+
+The main goal of virto-user is to allow high performance userspace drivers/devices
+to be defined and implemented in a way that is decoupled
+from guest kernels and host hypervisors;
+even socket interfaces are not assumed to exist,
+with only virtqueues and shared memory as the basic transport.
+
+The device implementations themselves live in shared libraries
+that plug in to the host hypervisor.
+The userspace driver implementation use existing guest userspace facilities
+for communicating with drivers,
+such as open()/ioctl()/read()/mmap() on Linux.
+
+This set of configuration struct and virtqueue message structs
+is meant to be implemented
+across a wide variety of guest kernels and host hypervisors.
+What follows are the requirements to implement virtio-user
+for a given guest kernel and a host hypervisor.
+
+\subsubsection{Kernel Portability Requirements}\label{sec:Device Types / User Device / Kernel and Hypervisor Portability Requirements / Kernel Portability Requirements}
+
+First, the guest kernel is required to be able to expose the enumerated devices
+in the existing way in which devices are exposed.
+For example, in Linux, misc_register must be available to add new entries
+to /dev/ for each device.
+Each such device is associated with the vendor id, device id, and version.
+For example, /dev/virtio-user/abcd:ef10:03 refers to vendor id 0xabcd, device id 0xef10, version 3.
+
+The guest kernel also needs some way to expose config operations to userspace
+and to the guest kernel space (as there are a few use cases that would involve implementing
+some kernel drivers in terms of virtio-userspace, such as sync fd's, usb, etc)
+In Linux, this is done by mapping open() to instance creation,
+the last close() to instance destruction,
+ioctl() for alloc/free/export/import,
+and mmap() to map memory.
+
+The guest kernel also needs some way to forward ping messages.
+In Linux, this can also be done via ioctl().
+
+The guest kernel also needs some way to expose event waiting.
+In Linux, this can be done via read(),
+and the return value will be revents in the event virtqueue message.
+
+\subsubsection{Hypervisor Portability Requirements}\label{sec:Device Types / User Device / Kernel and Hypervisor Portability Requirements / Kernel Portability Requirements}
+
+The first capability the host hypervisor will need to support is runtime mapping of
+host pointers to guest physical addresses.
+As of this writing, this is available in KVM, Intel HAXM, and macOS Hypervisor.framework.
+
+Next, the host hypervisor will need to support shared library plugin loading.
+This is so the device implementation can be separate from the host hypervisor.
+The device implementations live in single shared libraries.
+There is one plugin shared library
+for each vendor/device id.
+The functions exposed by each shared library shall have the following form:
+
+\begin{lstlisting}
+void register_memory_mapping_funcs(
+    bool (*map_guest_ram)(le64 phys_addr, void* host_ptr, le64 size),
+    bool (*unmap_guest_ram)(le64 phys_addr, le64 size));
+void get_device_config_info(le32* vendorId, le32* deviceId, le32* version);
+bool on_create_instance(le64 instance_handle);
+void on_destroy_instance(le64 instance_handle);
+le32 on_instance_ping(le64 instance_handle, le64 metadata, le64 phys_addr, void* host_ptr, le32 events);
+\end{lstlisting}
+
+The host hypervisor's plugin loading system will load set of such shared libraries
+and resolve their vendor id, device id, and versions,
+which populates the information necessary for device enumeration to work.
+
+Each instance is able to use the results of \field{register_memory_mapping_funcs}
+to communicate with the host hypervisor to map/unmap the shared memory
+to host buffers.
+
+When an instance with a given vendor and device id is created via
+\field{on_create_instance}, the host hypervisor runs
+the plugin's \field{on_create_instance} function.
+
+When an instance is destroyed,
+the host hypervisor runs the plugin's \field{on_destroy_instance} call.
+
+When a ping happens,
+the host hypervisor calls the \field{on_instance_ping} of the plugin that is associated
+with the \field{instance_handle}.
+
+If \field{shm_id} and \field{shm_offset} are valid, \field{phys_addr} is populated
+with the corresponding guest physical address.
+
+If the guest physical address is mapped to a host pointer somewhere, then
+\field{host_ptr} is populated.
+
+The return value from the plugin is then used as revents,
+and if the events was nonzero, the event virtqueue will be used to
+send revents back to the guest.
+
+Given the portable guest OS / host hypervisor, an existing set of shared libraries
+implementing a device can be used for many different guest OSes and hypervisors
+that support virtio-user.
+
+In the guest side, there needs to be a similar set of libraries to send
+commands; these depend more on the specifics of the guest OS and how
+virtio-user was exposed, but it will tend to be a parallel set of shared
+libraries in guest userspace where only guest OS-specific customizations need
+to be made while the basic protocol remains the same.
