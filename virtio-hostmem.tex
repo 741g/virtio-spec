@@ -290,13 +290,12 @@ This allows notifications to coherently access to device memory
 from both the host and guest, given a few extra considerations.
 For example, for architectures that do not have store/load coherency (i.e., not x86)
 an explicit set of fence or synchronization instructions will also be run by virtio-hostmem
-both before and after the call to \field{on_instance_ping}.
+after the message arrives on the host.
 An alternative is to leave this up to the implementor of the virtual device,
 but it is going to be such a common case to synchronize views of the same memory
 that it is probably a good idea to include synchronization out of the box.
 
-Although, it may be common to block a guest thread until \field{on_instance_ping}
-completes on the device side.
+Although, it may be common to block a guest thread until whatever is happing on the host completes.
 That is the purpose of the \field{events} field; the guest can populate it
 if it is desired to sync on the host completion.
 If \field{events} is not zero, then a reply shall be sent
@@ -351,6 +350,5 @@ as detailed in the section on ping virtqueue messages.
 
 The guest driver can distinguish which instance receives which ping using
 \field{instance_handle}.
-The field \field{revents} is written by the return value of
-\field{on_instance_ping} from the device side.
+The field \field{revents} is written by the device.
 
