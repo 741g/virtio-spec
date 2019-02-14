@@ -6,7 +6,6 @@ that allows sharing of host memory to the guest.
 virtio-hostmem is a device for sharing host memory to the guest.
 It runs on top of virtio-pci for virtqueue messages and
 uses the PCI address space for direct access like virtio-fs does.
-
 virtio-hostmem's purpose is
 to allow high performance general memory accesses between guest and host,
 and to allow the guest to access host memory constructed at runtime,
@@ -14,25 +13,37 @@ such as mapped memory from graphics APIs.
 
 Note that vhost-pci/vhost-vsock, virtio-vsock, and virtio-fs
 are also general ways to share data between the guest and host,
-but they are specialized to socket APIs in the guest,
+but they are specialized to socket APIs in the guest plus
+having host OS-dependent socket communication mechanism,
 or depend on a FUSE implementation.
-virtio-hostmem provides such communication mechanism over raw memory,
+
+virtio-hostmem provides such communication mechanisms over raw host memory,
 which has benefits of being more portable across hypervisors and guest OSes,
 and potentially higher performance due to always being physically contiguous to the guest.
 
 The guest can create "instances" which capture
 a particular use case of the device.
+Different use cases are distinguished by different sub-device IDs;
 virtio-hostmem is like virtio-input in that the guest can query
 for sub-devices with IDs;
 the guest provides vendor and device id in configuration.
 The host then accepts or rejects the instance creation request.
+
+When a virtio-hostmem instance in the guest is created,
+a use-case-specific initialization happens on the host
+in response to the creation request.
+The guest and host communicate directly
+over the config tx/rx, ping, and event virtqueues.
+The host dispatches the resulting messages in a device specific manner,
+like how virtio-input dispatches to keyboard versus mouse devices.
 
 Once instance creation succeeds,
 shared-mem objects can be allocated from each instance.
 Also, different instances can share the same shared-mem objects
 through export/import operations.
 On the host, it is assumed that the hypervisor will handle
-all backing of the shared memory objects with actual memory of some kind.
+all backing of the shared memory objects with actual memory of some kind,
+in a use-case-specific manner.
 
 In operating the device, a ping virtqueue is used for the guest to notify the host
 when something interesting has happened in the shared memory.
@@ -40,11 +51,83 @@ Conversely, the event virtqueue is used for the host to notify the guest.
 Note that this is asymmetric;
 it is expected that the guest will initiate most operations via ping virtqueue,
 while occasionally using the event virtqueue to wait on host completions.
+This makes it well suited for many kinds of high performance / low latency
+devices such as graphics API forwarding, audio/video codecs, sensors, etc.
 
 Both guest kernel and userspace drivers can be written using operations
 on virtio-hostmem in a way that mirrors UIO for Linux;
 open()/close()/ioctl()/read()/write()/mmap(),
 but concrete implementations are outside the scope of this spec.
+
+\subsection{Example Use Case}\label{sec:Device Types / Host Memory Device / Example Use Case}
+
+Suppose the guest wants to decode a compressed video buffer.
+
+\begin{enumerate}
+
+\item Guest creates an instance for the codec vendor id / device id / revision.
+
+\item Guest allocates into the PCI region via config virtqueue messages.
+
+\item Guest sends a message over the ping virtqueue for the host to back that memory.
+
+\item Host codec device implementation exposes codec library's buffer directly to guest.
+
+\item Guest: now that the memory is host backed, the guest mmap()'s and
+    downloads the compressed video stream directly to the host buffer.
+
+\item Guest: After a packet of compressed video stream is downloaded to the
+    buffer, another message, like a doorbell, is sent on the ping virtqueue to
+        consume existing compressed data. The ping message's offset field is
+        set to the proper offset into the shared-mem object.
+
+\item Host: The ping message arrives on the host and the offset is resolved to
+    a physical address and then, if possible, the physical address to a host
+        pointer. Since the memory is now backed, the host pointer is also
+        resolved.
+
+\item Host: Codec implementation decodes the video and puts the decoded frames
+    to either a host-side display library (thus with no further guest
+        communication necessary), or puts the raw decompressed frame to a
+        further offset in the host buffer that the guest knows about.
+
+\item Guest: Continue downloading video streams and hitting the doorbell, or
+    optionally, wait until the host is done first. If scheduling is not that
+        big of an impact, this can be done without even any further VM exit, by
+        the host writing to an agreed memory location when decoding is done,
+        then the guest uses a polling sleep(N) where N is the correctly tuned
+        timeout such that only a few poll spins are necessary.
+
+\item Guest: Or, the host can send back on the event virtqueue \field{revents}
+    and the guest can perform a blocking read() for it.
+
+\end{enumerate}
+
+The unique / interesting aspects of virtio-hostmem are demonstrated:
+
+\begin{enumerate}
+
+\item During instance creation the host was allowed to reject the request if
+    the codec device did not exist on host.
+
+\item The host can expose a codec library buffer directly to the guest, allowing the guest to write into it with zero copy and the host to decompress again without copying.
+
+\item Large bidirectional transfers are possible with zero copy.
+
+\item Large bidirectional transfers are possible without scatterlists, because
+    the memory is always physically contiguous.
+
+\item It is not necessary to use socket datagrams or data streams to
+    communicate the ping messages; they can be raw structs fresh off the
+        virtqueue.
+
+\item After decoding, the guest has the option but not the requirement to wait
+    for the host round trip, allowing for async operation of the codec.
+
+\item The guest has the option but not the requirement to wait for the host
+    round trip, allowing for async operation of the codec.
+
+\end{enumerate}
 
 \subsection{Device ID}\label{sec:Device Types / Host Memory Device / Device ID}
 
