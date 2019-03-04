@@ -49,6 +49,9 @@ These guest physical memory regions persist throughout the lifetime of the VMM;
 they are not created or destroyed dynamically even if the virtio-hostmem device
 is realized as a PCI device that can hotplug.
 
+The guest physical regions must not overlap and must not be shared
+directly across different sub-device types.
+
 \subsection{Sub-devices and Instances}\label{sec:Device Types / Host Memory Device / Sub-devices and Instances}
 
 The guest and host communicate
