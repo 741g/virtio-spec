@@ -23,7 +23,7 @@ as opposed to sockets,
 which has benefits of being more portable across hypervisors and guest OSes,
 and potentially higher performance due to always being physically contiguous to the guest.
 
-\subsection{Communication over Fixed Host Memory Regions}\label{sec:Device Types / Host Memory Device / Communication over Fixed Host Memory Regions}
+\subsection{Fixed Host Memory Regions}\label{sec:Device Types / Host Memory Device / Communication over Fixed Host Memory Regions}
 
 Shmids will be set up as a set of fixed ranges on boot,
 one for each sub-device available.
@@ -35,7 +35,12 @@ and bounds the maximum amount of guest physical memory that can be used.
 
 It is always assumed that the memory regions act as RAM
 and are backed in some way by the host.
-The host is allowed to modify which host pointers
+There is no caching, all access is coherent.
+When the guest sends notifications to the host,
+Memory fence instructions are automatically deployed
+for architectures without store/load coherency.
+
+The host is allowed to lazily back / modify which host pointers
 correspond to the physical address ranges of such regions,
 such as in response to sub-device specific protocols,
 but is never allowed to leave those mappings unmapped.
@@ -63,6 +68,17 @@ associated with its particular sub-device,
 and only knows the offset into the associated memory region.
 It is up to the userspace driver / device implementation to
 resolve how offsets into the memory region are shared across instances or not.
+
+This means that it is possible to share the same physical pages across multiple processes,
+which is useful for implementing functionality such as gralloc/ashmem/dmabuf;
+virtio-hostmem only guarantees the security boundaries where
+no sub-device instance is allowed to access the memory of an instance of
+a different sub-device.
+
+Indeed, it is possible for a malicious guest process to improperly access
+the shared memory of a gralloc/ashmem/dmabuf implementation on virtio-hostmem,
+but we regard that as a flaw in the security model of the guest,
+not the security model of virtio-hostmem.
 
 When a virtio-hostmem instance in the guest is created,
 a use-case-specific initialization happens on the host
@@ -99,9 +115,12 @@ Suppose the guest wants to decode a compressed video buffer.
     with the codec device.
 
 \item On startup, a physical address range, say 128 MB, is associated with the codec device.
+    The range must be usable as RAM, so the host backs it as part of the guest startup process.
 
 \item To save memory, the codec device implementation on the host
-    can begin servicing this range via mapping them all to the same host page. But this is not required.
+    can begin servicing this range via mapping them all to the same host page. But this is not required;
+        the host can initialize a codec library buffer on the host on bootup and pre-allocate the entire region there.
+        The main invariant is that the physical address range is never not mapped as RAM and usable as RAM.
 
 \item Guest creates an instance for the codec vendor id / device id / revision
     via sending a message over the config virtqueue.
@@ -333,7 +352,7 @@ These messages are sent from the guest to host
 on the notification virtqueue.
 
 \begin{lstlisting}
-struct virtio_hostmem_ping {
+struct virtio_hostmem_notification {
     le64 instance_handle;
     le64 metadata;
     le64 shm_offset;
@@ -370,6 +389,7 @@ back to the guest via the event virtqueue,
 with the \field{revents} set to the appropriate value.
 
 Flow control:
+
 Arbitrary levels of traffic can be sent
 on the notification virtqueues for guest instances.
 Ordering of messages within an instance is patently preserved
@@ -390,6 +410,18 @@ The notification message is then suitable for DMA operations in both directions,
 such as glTexImage2D and glReadPixels,
 and audio/video (de)compression (guest populates shared memory with (de)compressed buffers,
 sends notification message, host (de)compresses into the same memory region).
+
+Note that we also impose precise semantics for any shared memory region transaction
+that is associated with a notification virtqueue message.
+
+On available buffer notification for the notification virtqueue:
+This means the guest has commited the information in the notification already,
+and that the guest has completed
+any memory transaction over the offset/size range in the sub-device's physical memory region.
+
+On used buffer notification for the notification virtqueue:
+This means the host has consumed the notficiation and has completed
+any memory transaction over the offset/size range in the sub-device's physical memory region.
 
 \subsubsection{Event Virtqueue Messages}\label{sec:Device Types / Host Memory Device / Device Operation / Event Virtqueue Messages}
 
