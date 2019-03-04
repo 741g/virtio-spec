@@ -3,9 +3,10 @@
 Note: This depends on the upcoming shared-mem type of virtio
 that allows sharing of host memory to the guest.
 
-virtio-hostmem is a device for sharing host memory to the guest.
+virtio-hostmem is a device for sharing host memory all the way to the guest userspace.
 It runs on top of virtio-pci for virtqueue messages and
 uses the PCI address space for direct access like virtio-fs does.
+
 virtio-hostmem's purpose is
 to allow high performance general memory accesses between guest and host,
 and to allow the guest to access host memory constructed at runtime,
@@ -17,42 +18,71 @@ but they are specialized to socket APIs in the guest plus
 having host OS-dependent socket communication mechanism,
 or depend on a FUSE implementation.
 
-virtio-hostmem provides such communication mechanisms over raw host memory,
+virtio-hostmem provides guest/host communication mechanisms over raw host memory,
+as opposed to sockets,
 which has benefits of being more portable across hypervisors and guest OSes,
 and potentially higher performance due to always being physically contiguous to the guest.
+
+\subsection{Communication over Fixed Host Memory Regions}\label{sec:Device Types / Host Memory Device / Communication over Fixed Host Memory Regions}
+
+Shmids will be set up as a set of fixed ranges on boot,
+one for each sub-device available.
+This means that the boot-up sequence plus the guest kernel
+configures memory regions used by sub-devices once on startup,
+and does not touch them again;
+this simplifies the set of possible behavior,
+and bounds the maximum amount of guest physical memory that can be used.
+
+It is always assumed that the memory regions act as RAM
+and are backed in some way by the host.
+The host is allowed to modify which host pointers
+correspond to the physical address ranges of such regions,
+such as in response to sub-device specific protocols,
+but is never allowed to leave those mappings unmapped.
+
+These guest physical memory regions persist throughout the lifetime of the VMM;
+they are not created or destroyed dynamically even if the virtio-hostmem device
+is realized as a PCI device that can hotplug.
+
+\subsection{Sub-devices and Instances}\label{sec:Device Types / Host Memory Device / Sub-devices and Instances}
+
+The guest and host communicate
+over the config, notification (tx) and event (rx) virtqueues.
+The config virtqueue is used for instance creation/destruction.
 
 The guest can create "instances" which capture
 a particular use case of the device.
 Different use cases are distinguished by different sub-device IDs;
 virtio-hostmem is like virtio-input in that the guest can query
-for sub-devices with IDs;
-the guest provides vendor and device id in configuration.
+for sub-devices that are implemented on the host via device and vendor ID's;
+the guest provides vendor and device id in a configuration message.
 The host then accepts or rejects the instance creation request.
+
+Each instance can only touch memory regions
+associated with its particular sub-device,
+and only knows the offset into the associated memory region.
+It is up to the userspace driver / device implementation to
+resolve how offsets into the memory region are shared across instances or not.
 
 When a virtio-hostmem instance in the guest is created,
 a use-case-specific initialization happens on the host
 in response to the creation request.
-The guest and host communicate directly
-over the config tx/rx, ping, and event virtqueues.
-The host dispatches the resulting messages in a device specific manner,
-like how virtio-input dispatches to keyboard versus mouse devices.
 
-Once instance creation succeeds,
-shared-mem objects can be allocated from each instance.
-Also, different instances can share the same shared-mem objects
-through export/import operations.
-On the host, it is assumed that the hypervisor will handle
-all backing of the shared memory objects with actual memory of some kind,
-in a use-case-specific manner.
-
-In operating the device, a ping virtqueue is used for the guest to notify the host
-when something interesting has happened in the shared memory.
-Conversely, the event virtqueue is used for the host to notify the guest.
-Note that this is asymmetric;
-it is expected that the guest will initiate most operations via ping virtqueue,
-while occasionally using the event virtqueue to wait on host completions.
+In operating the device, a notification virtqueue is used for the guest to notify the host
+when something interesting has happened in the shared memory via communicating
+the offset / size of any transaction, if applicable, and metadata.
 This makes it well suited for many kinds of high performance / low latency
-devices such as graphics API forwarding, audio/video codecs, sensors, etc.
+devices such as graphics API forwarding, audio/video codecs, sensors, etc;
+no actual memory is sent over the virtqueue.
+
+Note that this is asymmetric;
+there will be on tx notification virtqueue for each guest instance,
+while there is only one rx event virtqueue for host to guest notifications.
+This is because it can be faster not to share the same virtqueue
+if multiple guest instances all use high bandwidth/low memory operations
+over the virtio-hostmem device to send data to the host;
+this is especially common for the case of graphics API forwarding
+and media codecs.
 
 Both guest kernel and userspace drivers can be written using operations
 on virtio-hostmem in a way that mirrors UIO for Linux;
@@ -65,34 +95,37 @@ Suppose the guest wants to decode a compressed video buffer.
 
 \begin{enumerate}
 
-\item Guest creates an instance for the codec vendor id / device id / revision.
+\item VMM is configured for codec support and a vendor/device/revision id is associated
+    with the codec device.
 
-\item Guest allocates into the PCI region via config virtqueue messages.
+\item On startup, a physical address range, say 128 MB, is associated with the codec device.
 
-\item Guest sends a message over the ping virtqueue for the host to back that memory.
+\item To save memory, the codec device implementation on the host
+    can begin servicing this range via mapping them all to the same host page. But this is not required.
 
-\item Host codec device implementation exposes codec library's buffer directly to guest.
+\item Guest creates an instance for the codec vendor id / device id / revision
+    via sending a message over the config virtqueue.
 
-\item Guest: now that the memory is host backed, the guest mmap()'s and
-    downloads the compressed video stream directly to the host buffer.
+\item Guest codec driver does an implementation dependent suballocation operation and communicates via
+    notification virtqueue to the host that this instance wants to use that sub-region.
+
+\item The host now does an implementation dependent operation to back the sub-region with usable memory.
+    But this is not required; the host could have set the entire region up at startup.
+
+\item Guest downloads compressed video buffers into that region.
 
 \item Guest: After a packet of compressed video stream is downloaded to the
-    buffer, another message, like a doorbell, is sent on the ping virtqueue to
-        consume existing compressed data. The ping message's offset field is
+    buffer, another message, like a doorbell, is sent on the notification virtqueue to
+        consume existing compressed data. The notification message's offset field is
         set to the proper offset into the shared-mem object.
-
-\item Host: The ping message arrives on the host and the offset is resolved to
-    a physical address and then, if possible, the physical address to a host
-        pointer. Since the memory is now backed, the host pointer is also
-        resolved.
 
 \item Host: Codec implementation decodes the video and puts the decoded frames
     to either a host-side display library (thus with no further guest
         communication necessary), or puts the raw decompressed frame to a
-        further offset in the host buffer that the guest knows about.
+        further offset in the shared memory region that the guest knows about.
 
-\item Guest: Continue downloading video streams and hitting the doorbell, or
-    optionally, wait until the host is done first. If scheduling is not that
+\item Guest: Continue downloading video streams and sending notifications,
+    or optionally, wait until the host is done first. If scheduling is not that
         big of an impact, this can be done without even any further VM exit, by
         the host writing to an agreed memory location when decoding is done,
         then the guest uses a polling sleep(N) where N is the correctly tuned
@@ -110,7 +143,8 @@ The unique / interesting aspects of virtio-hostmem are demonstrated:
 \item During instance creation the host was allowed to reject the request if
     the codec device did not exist on host.
 
-\item The host can expose a codec library buffer directly to the guest, allowing the guest to write into it with zero copy and the host to decompress again without copying.
+\item The host can expose a codec library buffer directly to the guest,
+    allowing the guest to write into it with zero copy and the host to decompress again without copying.
 
 \item Large bidirectional transfers are possible with zero copy.
 
@@ -118,7 +152,7 @@ The unique / interesting aspects of virtio-hostmem are demonstrated:
     the memory is always physically contiguous.
 
 \item It is not necessary to use socket datagrams or data streams to
-    communicate the ping messages; they can be raw structs fresh off the
+    communicate the notification messages; they can be raw structs fresh off the
         virtqueue.
 
 \item After decoding, the guest has the option but not the requirement to wait
@@ -136,11 +170,14 @@ The unique / interesting aspects of virtio-hostmem are demonstrated:
 \subsection{Virtqueues}\label{sec:Device Types / Host Memory Device / Virtqueues}
 
 \begin{description}
-\item[0] config tx
-\item[1] config rx
-\item[2] ping
-\item[3] event
+\item[0] config
+\item[1] event
+\item[2..n] notification
 \end{description}
+
+There is one notification virtqueue for each instance.
+The maximum number of virtqueue is kept to an implementation-specific limit
+that is stored in the configuration layout.
 
 \subsection{Feature bits}\label{sec: Device Types / Host Memory Device / Feature bits }
 
@@ -152,37 +189,53 @@ No feature bit requirements.
 
 \subsection{Device configuration layout}\label{sec:Device Types / Host Memory Device / Device configuration layout}
 
+The configuration layout enumerates all sub-devices and a guest physical memory region
+for each sub-device.
+
 \begin{lstlisting}
+struct virtio_hostmem_device_memory_region {
+    le64 phys_addr_start;
+    le64 phys_addr_end;
+}
+
 struct virtio_hostmem_device_info {
     le32 vendor_id;
     le32 device_id;
     le32 revision;
+    struct virtio_hostmem_device_memory_region mem_region;
 }
 
 struct virtio_hostmem_config {
-    le64 reserved_size;
     le32 num_devices;
     virtio_hostmem_device_info available_devices[MAX_DEVICES];
+    le32 MAX_INSTANCES;
 };
+
+One shared memory shmid is associatd with each sub-device.
+
 \end{lstlisting}
+
+\field{virtio_hostmem_device_memory_region} describes a particular memory region
+corresponding to a sub-device.
 
 \field{virtio_hostmem_device_info} describes a particular usage of the device
 in terms of the vendor / device ID and revision.
-
-\field{reserved_size} is the amount of address space taken away from the guest
-to support virtio-hostmem.
-A sufficient setting for most purposes is 16 GB.
 
 \field{num_devices} represents the number of valid entries in \field{available_devices}.
 
 \field{available_devices} represents the set of available usages of virtio-hostmem (up to \field{MAX_DEVICES}).
 
 \field{MAX_DEVICES} is the maximum number of sub-devices possible (here, set to 32).
+\field{MAX_INSTANCES} is the maximum number of instances possible (here, set to 4096).
 
 \subsection{Device Initialization}\label{sec:Device Types / Host Memory Device / Device Initialization}
 
-Initialization of virtio-hostmem works much like other virtio PCI devices.
-It will need a PCI device ID.
+When the guest starts up, regardless of whether it is plugged in,
+memory regions for each sub-device will be reserved.
+
+When the hostmem device is plugged in via PCI,
+instance creation/destruction and message sending is allowed.
+Otherwise all operations fail with a guest specific error code.
 
 \subsection{Device Operation}\label{sec:Device Types / Host Memory Device / Device Operation}
 
@@ -198,10 +251,6 @@ struct virtio_hostmem_config_msg {
     le32 device_id;
     le32 revision;
     le64 instance_handle;
-    le64 shm_id;
-    le64 shm_offset;
-    le64 shm_size;
-    le32 shm_flags;
     le32 error;
 }
 \end{lstlisting}
@@ -212,10 +261,6 @@ struct virtio_hostmem_config_msg {
 enum {
     VIRTIO_HOSTMEM_CONFIG_OP_CREATE_INSTANCE;
     VIRTIO_HOSTMEM_CONFIG_OP_DESTROY_INSTANCE;
-    VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_ALLOC;
-    VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_FREE;
-    VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_EXPORT;
-    VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_IMPORT;
 }
 \end{lstlisting}
 
@@ -225,9 +270,6 @@ enum {
 enum {
     VIRTIO_HOSTMEM_ERROR_CONFIG_DEVICE_INITIALIZATION_FAILED;
     VIRTIO_HOSTMEM_ERROR_CONFIG_INSTANCE_CREATION_FAILED;
-    VIRTIO_HOSTMEM_ERROR_CONFIG_SHARED_MEMORY_ALLOC_FAILED;
-    VIRTIO_HOSTMEM_ERROR_CONFIG_SHARED_MEMORY_EXPORT_FAILED;
-    VIRTIO_HOSTMEM_ERROR_CONFIG_SHARED_MEMORY_IMPORT_FAILED;
 }
 \end{lstlisting}
 
@@ -267,58 +309,8 @@ on the config tx virtqueue.
 The only field that needs to be populated
 is \field{instance_handle}.
 
-Destroying the instance unmaps from the guest PCI space
-and also unmaps on the host side
-for all non-exported/imported allocations of the instance.
-For exported or imported allocations, unmapping
-only occurs when a shared-mem-specific refcount reaches zero.
-
-The other kinds of config message concern creation of shared host memory regions.
-The shared memory configuration operations are as follows:
-
-Shared memory operations:
-
-The guest sends a \field{virtio_hostmem_config_msg}
-with \field{msg_type} equal to \field{VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_ALLOC}
-on the config tx virtqueue.
-\field{instance_handle} needs to be a valid instance handle generated by the host.
-\field{shm_size} must be set and greater than zero.
-A new shared memory region is created in the PCI address space (actual allocation is deferred).
-If any operation fails, a message on the config tx virtqueue
-with \field{msg_type} equal to \field{VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_ALLOC}
-and \field{error} equal to \field{VIRTIO_HOSTMEM_ERROR_CONFIG_SHARED_MEMORY_ALLOC_FAILED}
-is sent.
-If all operations succeed,
-a new \field{shm_id} is generated along with \field{shm_offset} (offset into the PCI).
-and sent back on the config tx virtqueue.
-
-Freeing shared memory objects works in a similar way,
-with setting \field{msg_type} equal to \field{VIRTIO_HOSTMEM_CONFIG_OP_SHARED_MEMORY_FREE}.
-If the memory has been shared,
-it is refcounted based on how many instance have used it.
-When the refcount reaches 0,
-the host hypervisor will explicitly unmap that shared memory object
-from any existing host pointers.
-
-To export a shared memory object, we need to have a valid \field{instance_handle}
-and an allocated shared memory object with a valid \field{shm_id}.
-The export operation itself for now is mostly administrative;
-it marks that allocated memory as available for sharing.
-
-To import a shared memory object, we need to have a valid \field{instance_handle}
-and an allocated shared memory object with a valid \field{shm_id}
-that has been allocated and exported. A new \field{shm_id} is not generated;
-this is mostly administrative and marks that that \field{shm_id}
-can also be used from the second instance.
-This is for sharing memory, so \field{instance_handle} need not
-be the same as the \field{instance_handle} that allocated the shared memory.
-
-This is similar to Vulkan \field{VK_KHR_external_memory},
-except over raw PCI address space and \field{shm_id}'s.
-
-For mapping and unmapping shared memory objects,
-we do not include explicit virtqueue methods for these,
-and instead rely on the guest kernel's memory mapping primitives.
+Destroying the instance does not affect the shared memory region.
+It is up to the driver/device implemenation to get refcounts correct.
 
 Flow control: Only one config message is allowed to be in flight
 either to or from the host at any time.
@@ -326,9 +318,9 @@ That is, the handshake tx/rx for device enumeration, instance creation, and shar
 are done in a globally visible single threaded manner.
 This is to make it easier to synchronize operations on shared memory and instance creation.
 
-\subsubsection{Ping Virtqueue Messages}\label{sec:Device Types / Host Memory Device / Device Operation / Ping Virtqueue Messages}
+\subsubsection{Notification Virtqueue Messages}\label{sec:Device Types / Host Memory Device / Device Operation / Notification Virtqueue Messages}
 
-Once the instances have been created and configured with shared memory,
+Once the instances have been created,
 we can already read/write memory, and for some devices, that may already be enough
 if they can operate lock-free and wait-free without needing notifications; we're done!
 
@@ -338,13 +330,12 @@ from the guest. This is captured via a new message struct,
 which is separate from the config struct because it's smaller and
 the common case is to send those messages.
 These messages are sent from the guest to host
-on the ping virtqueue.
+on the notification virtqueue.
 
 \begin{lstlisting}
 struct virtio_hostmem_ping {
     le64 instance_handle;
     le64 metadata;
-    le64 shm_id;
     le64 shm_offset;
     le64 shm_size;
     le64 phys_addr;
@@ -354,20 +345,13 @@ struct virtio_hostmem_ping {
 \end{lstlisting}
 
 \field{instance_handle} must be a valid instance handle.
-\field{shm_id} need not be a valid shm_id.
-If \field{shm_id} is a valid shm_id,
-it need not be allocated on the host yet.
+\field{shm_offset} and \field{shm_size}
+are treated as offsets into the sub-device's shared memory region.
 
-If \field{shm_id} is a valid shm_id,
 For security reasons,
-\field{phys_addr} is resolved given \field{shm_offset} by
-the virtio-hostmem driver after the message arrives to the driver.
-
-If \field{shm_id} is a valid shm_id
-and there is a mapping set up for \field{phys_addr},
-\field{host_addr} refers to the corresponding memory view in the host address space.
-For security reasons,
-\field{host_addr} is only resolved on the host after the message arrives on the host.
+\field{host_addr} is only resolved on the host after the message arrives on the host,
+and \field{phys_addr} is only resolved by either the host, or the guest kernel
+(as it also knows about the regions).
 
 This allows notifications to coherently access to device memory
 from both the host and guest, given a few extra considerations.
@@ -385,28 +369,31 @@ If \field{events} is not zero, then a reply shall be sent
 back to the guest via the event virtqueue,
 with the \field{revents} set to the appropriate value.
 
-Flow control: Arbitrary levels of traffic can be sent
-on the ping virtqueue from multiple instances at the same time,
-but ordering within an instance is strictly preserved.
+Flow control:
+Arbitrary levels of traffic can be sent
+on the notification virtqueues for guest instances.
+Ordering of messages within an instance is patently preserved
+due to having one virtqueue per instance.
 Additional resources outside the virtqueue are used to hold incoming messages
 if the virtqueue itself fills up.
+
 This is similar to how virtio-vsock handles high traffic.
 However, there will be a limit on the maximum number of messages in flight
 to prevent the guest from over-notifying the host.
 Once the limit is reached, the guest blocks until the number of messages in flight
 is decreased.
 
-The semantics of ping messages themselves also are not restricted to guest to host only;
+The semantics of notification messages themselves also are not restricted to guest to host only;
 the shared memory region named in the message can also be filled by the host
 and used as receive traffic by the guest.
-The ping message is then suitable for DMA operations in both directions,
+The notification message is then suitable for DMA operations in both directions,
 such as glTexImage2D and glReadPixels,
 and audio/video (de)compression (guest populates shared memory with (de)compressed buffers,
-sends ping message, host (de)compresses into the same memory region).
+sends notification message, host (de)compresses into the same memory region).
 
 \subsubsection{Event Virtqueue Messages}\label{sec:Device Types / Host Memory Device / Device Operation / Event Virtqueue Messages}
 
-Ping virtqueue messages are enough to cover all async device operations;
+Notification virtqueue messages are enough to cover all async device operations;
 that is, operations that do not require a round trip from the host.
 This is useful for most kinds of graphics API forwarding along
 with media codecs.
@@ -429,9 +416,15 @@ struct virtio_hostmem_event {
 \end{lstlisting}
 
 Event messages are sent back to the guest if \field{events} field is nonzero,
-as detailed in the section on ping virtqueue messages.
+as detailed in the section on notification virtqueue messages.
 
-The guest driver can distinguish which instance receives which ping using
+The guest driver can distinguish which instance receives which notificationotification
 \field{instance_handle}.
 The field \field{revents} is written by the device.
 
+There is only one event virtqueue because it ends to be more complex to support
+multiple queues at once in one interrupt handler,
+and interrupt handlers are likely to play a role in most implementations;
+the interrupt handler would watch the event virtqueue,
+and on interrupt, empty it, unblocking the waiting guest threads if they are
+waiting for events.
